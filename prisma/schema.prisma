@@ -1,0 +1,559 @@
+// Booking App - Schema bazy danych
+// Faza 1: Rezerwacje + ręczne pakiety
+// Faza 2 (zaprojektowane na przyszłość): płatności, kody promo, polecenia, wyzwania
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================
+// AUTH.js (NextAuth) wymagane tabele
+// =========================================
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// =========================================
+// USERS - klienci + admini
+// =========================================
+
+enum UserRole {
+  CLIENT
+  ADMIN
+  TRAINER // na przyszłość
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  emailVerified DateTime?
+  passwordHash  String?   @map("password_hash")
+  firstName     String?   @map("first_name")
+  lastName      String?   @map("last_name")
+  phone         String?
+  role          UserRole  @default(CLIENT)
+
+  // Faza 2: system poleceń
+  referralCode      String? @unique @map("referral_code")
+  referredByUserId  String? @map("referred_by_user_id")
+  referredByUser    User?   @relation("UserReferrals", fields: [referredByUserId], references: [id])
+  referredUsers     User[]  @relation("UserReferrals")
+
+  isActive  Boolean   @default(true) @map("is_active")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  // Relacje
+  accounts            Account[]
+  sessions            Session[]
+  reservations        Reservation[]
+  userPackages        UserPackage[]
+  packageCredits      PackageCredit[]
+  assignedPackages    UserPackage[]   @relation("AssignedByAdmin")
+  trainedClasses      Class[]         @relation("ClassTrainer")
+  payments            Payment[]
+  referralsAsReferrer Referral[]      @relation("ReferralReferrer")
+  referralsAsReferred Referral[]      @relation("ReferralReferred")
+  challengeParticipations ChallengeParticipant[]
+  notifications       Notification[]
+  promoCodeUsages     PromoCodeUsage[]
+  auditLogs           AuditLog[]
+
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+// =========================================
+// CLASS TYPES (FBW, Zdrowe Plecy, Hyrox, ...)
+// =========================================
+
+model ClassType {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  slug            String   @unique
+  description     String?  @db.Text
+  durationMinutes Int      @default(60) @map("duration_minutes")
+  colorHex        String   @default("#0ea5e9") @map("color_hex")
+  isActive        Boolean  @default(true) @map("is_active")
+  sortOrder       Int      @default(0) @map("sort_order")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  classes Class[]
+
+  @@map("class_types")
+}
+
+// =========================================
+// CLASSES - konkretne terminy zajęć
+// =========================================
+
+enum ClassStatus {
+  SCHEDULED
+  CANCELLED
+  COMPLETED
+}
+
+model Class {
+  id                       String      @id @default(cuid())
+  classTypeId              String      @map("class_type_id")
+  trainerId                String?     @map("trainer_id")
+  startsAt                 DateTime    @map("starts_at")
+  endsAt                   DateTime    @map("ends_at")
+  capacity                 Int
+  location                 String?
+  status                   ClassStatus @default(SCHEDULED)
+  // Override globalnej polityki dla konkretnych zajęć (null = użyj globalnej)
+  cancellationWindowHours  Int?        @map("cancellation_window_hours")
+  notes                    String?     @db.Text
+  createdAt                DateTime    @default(now()) @map("created_at")
+  updatedAt                DateTime    @updatedAt @map("updated_at")
+
+  classType    ClassType     @relation(fields: [classTypeId], references: [id])
+  trainer      User?         @relation("ClassTrainer", fields: [trainerId], references: [id])
+  reservations Reservation[]
+
+  @@index([startsAt])
+  @@index([classTypeId])
+  @@index([status])
+  @@map("classes")
+}
+
+// =========================================
+// RESERVATIONS - rezerwacje
+// =========================================
+
+enum ReservationStatus {
+  CONFIRMED        // aktywna rezerwacja
+  CANCELLED_BY_USER // anulowana w terminie (kredyt zwrócony)
+  CANCELLED_LATE   // anulowana za późno (kredyt przepadł)
+  CANCELLED_BY_ADMIN // anulowane przez admina (kredyt zwrócony)
+  NO_SHOW          // klient nie pojawił się
+  ATTENDED         // klient był obecny
+}
+
+model Reservation {
+  id               String            @id @default(cuid())
+  userId           String            @map("user_id")
+  classId          String            @map("class_id")
+  status           ReservationStatus @default(CONFIRMED)
+  packageCreditId  String?           @unique @map("package_credit_id")
+  reservedAt       DateTime          @default(now()) @map("reserved_at")
+  cancelledAt      DateTime?         @map("cancelled_at")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  user          User           @relation(fields: [userId], references: [id])
+  class         Class          @relation(fields: [classId], references: [id])
+  packageCredit PackageCredit? @relation(fields: [packageCreditId], references: [id])
+
+  // user może mieć tylko jedną aktywną (CONFIRMED) rezerwację na dane zajęcia
+  // tę regułę egzekwujemy aplikacyjnie - MySQL nie wspiera partial unique
+  @@index([userId, classId])
+  @@index([classId, status])
+  @@index([userId, status])
+  @@map("reservations")
+}
+
+// =========================================
+// PACKAGES - słownik pakietów (1, 4, 8, 12)
+// =========================================
+
+model Package {
+  id            String   @id @default(cuid())
+  name          String
+  creditsCount  Int      @map("credits_count")
+  pricePln      Decimal  @default(0) @map("price_pln") @db.Decimal(10, 2)
+  validityDays  Int      @default(60) @map("validity_days") // ważność w dniach
+  isActive      Boolean  @default(true) @map("is_active")
+  sortOrder     Int      @default(0) @map("sort_order")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  userPackages UserPackage[]
+  payments     Payment[]
+  promoCodes   PromoCode[]
+
+  @@map("packages")
+}
+
+// =========================================
+// USER PACKAGES - pakiety przypisane userom
+// =========================================
+
+enum PackageSource {
+  MANUAL_ADMIN       // ręcznie dodany przez admina (Faza 1)
+  ONLINE_PAYMENT     // zakup online (Faza 2)
+  REFERRAL_BONUS     // bonus z polecenia
+  PROMO              // z kodu promo / wyzwania
+}
+
+model UserPackage {
+  id                  String        @id @default(cuid())
+  userId              String        @map("user_id")
+  packageId           String        @map("package_id")
+  creditsTotal        Int           @map("credits_total")
+  creditsRemaining    Int           @map("credits_remaining") // denormalizacja
+  purchasedAt         DateTime      @default(now()) @map("purchased_at")
+  expiresAt           DateTime?     @map("expires_at")
+  source              PackageSource @default(MANUAL_ADMIN)
+  paymentId           String?       @map("payment_id")
+  assignedByAdminId   String?       @map("assigned_by_admin_id")
+  notes               String?       @db.Text
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  user             User            @relation(fields: [userId], references: [id])
+  package          Package         @relation(fields: [packageId], references: [id])
+  assignedByAdmin  User?           @relation("AssignedByAdmin", fields: [assignedByAdminId], references: [id])
+  payment          Payment?        @relation(fields: [paymentId], references: [id])
+  credits          PackageCredit[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("user_packages")
+}
+
+// =========================================
+// PACKAGE CREDITS - pojedyncze kredyty (godziny)
+// Kluczowa decyzja: każda godzina ma własny rekord
+// Dzięki temu wiemy do którego pakietu wrócić przy zwrocie
+// =========================================
+
+enum CreditStatus {
+  AVAILABLE
+  RESERVED   // zarezerwowane (jeszcze nie po zajęciach)
+  USED       // wykorzystane (zajęcia minęły lub anulowane za późno)
+  EXPIRED    // wygasł
+  REFUNDED   // zwrócony (np. admin anulował zajęcia)
+}
+
+model PackageCredit {
+  id            String       @id @default(cuid())
+  userPackageId String       @map("user_package_id")
+  userId        String       @map("user_id") // denormalizacja
+  status        CreditStatus @default(AVAILABLE)
+  usedAt        DateTime?    @map("used_at")
+  expiresAt     DateTime?    @map("expires_at")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  userPackage  UserPackage   @relation(fields: [userPackageId], references: [id])
+  user         User          @relation(fields: [userId], references: [id])
+  reservation  Reservation?
+
+  @@index([userId, status])
+  @@index([userPackageId])
+  @@index([expiresAt])
+  @@map("package_credits")
+}
+
+// =========================================
+// SETTINGS - konfiguracja systemu
+// =========================================
+
+model Setting {
+  key         String   @id
+  value       String   @db.Text // JSON
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  updatedById String?  @map("updated_by_id")
+
+  @@map("settings")
+}
+
+// =========================================
+// FAZA 2: PŁATNOŚCI
+// =========================================
+
+enum PaymentProvider {
+  PRZELEWY24
+  TPAY
+  STRIPE
+  MANUAL // dla testów lub płatności gotówką
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+model Payment {
+  id                  String          @id @default(cuid())
+  userId              String          @map("user_id")
+  packageId           String          @map("package_id")
+  amountPln           Decimal         @map("amount_pln") @db.Decimal(10, 2)
+  currency            String          @default("PLN")
+  provider            PaymentProvider
+  providerPaymentId   String?         @map("provider_payment_id")
+  providerStatus      String?         @map("provider_status")
+  status              PaymentStatus   @default(PENDING)
+  promoCodeId         String?         @map("promo_code_id")
+  discountAmountPln   Decimal         @default(0) @map("discount_amount_pln") @db.Decimal(10, 2)
+  metadata            String?         @db.Text // JSON
+  createdAt           DateTime        @default(now()) @map("created_at")
+  completedAt         DateTime?       @map("completed_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
+
+  user         User          @relation(fields: [userId], references: [id])
+  package      Package       @relation(fields: [packageId], references: [id])
+  promoCode    PromoCode?    @relation(fields: [promoCodeId], references: [id])
+  userPackages UserPackage[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("payments")
+}
+
+// =========================================
+// FAZA 2: KODY PROMO
+// =========================================
+
+enum PromoCodeType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_CREDITS
+}
+
+model PromoCode {
+  id                   String        @id @default(cuid())
+  code                 String        @unique
+  type                 PromoCodeType
+  value                Decimal       @db.Decimal(10, 2)
+  appliesToPackageId   String?       @map("applies_to_package_id")
+  maxUses              Int?          @map("max_uses")
+  currentUses          Int           @default(0) @map("current_uses")
+  maxUsesPerUser       Int           @default(1) @map("max_uses_per_user")
+  validFrom            DateTime      @map("valid_from")
+  validUntil           DateTime      @map("valid_until")
+  isActive             Boolean       @default(true) @map("is_active")
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  appliesToPackage Package?         @relation(fields: [appliesToPackageId], references: [id])
+  usages           PromoCodeUsage[]
+  payments         Payment[]
+
+  @@map("promo_codes")
+}
+
+model PromoCodeUsage {
+  id          String   @id @default(cuid())
+  promoCodeId String   @map("promo_code_id")
+  userId      String   @map("user_id")
+  usedAt      DateTime @default(now()) @map("used_at")
+
+  promoCode PromoCode @relation(fields: [promoCodeId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("promo_code_usages")
+}
+
+// =========================================
+// FAZA 2: SYSTEM POLECEŃ
+// =========================================
+
+enum ReferralStatus {
+  PENDING    // polecony się zarejestrował
+  QUALIFIED  // polecony zrobił pierwszą płatność
+  REWARDED   // nagrody wypłacone
+}
+
+model Referral {
+  id                     String         @id @default(cuid())
+  referrerUserId         String         @map("referrer_user_id")
+  referredUserId         String         @unique @map("referred_user_id")
+  status                 ReferralStatus @default(PENDING)
+  qualifyingPaymentId    String?        @map("qualifying_payment_id")
+  rewardCreditsReferrer  Int            @default(0) @map("reward_credits_referrer")
+  rewardCreditsReferred  Int            @default(0) @map("reward_credits_referred")
+  createdAt              DateTime       @default(now()) @map("created_at")
+  qualifiedAt            DateTime?      @map("qualified_at")
+  rewardedAt             DateTime?      @map("rewarded_at")
+
+  referrer User @relation("ReferralReferrer", fields: [referrerUserId], references: [id])
+  referred User @relation("ReferralReferred", fields: [referredUserId], references: [id])
+
+  @@map("referrals")
+}
+
+// =========================================
+// FAZA 2: WYZWANIA / KONKURSY
+// =========================================
+
+enum ChallengeType {
+  ATTENDANCE_STREAK
+  TOTAL_CLASSES
+  CUSTOM
+}
+
+enum ChallengeRewardType {
+  FREE_CREDITS
+  DISCOUNT
+  PHYSICAL_PRIZE
+}
+
+model Challenge {
+  id          String              @id @default(cuid())
+  name        String
+  description String?             @db.Text
+  type        ChallengeType
+  rules       String              @db.Text // JSON
+  rewardType  ChallengeRewardType @map("reward_type")
+  rewardValue String              @db.Text @map("reward_value") // JSON
+  startsAt    DateTime            @map("starts_at")
+  endsAt      DateTime            @map("ends_at")
+  isActive    Boolean             @default(true) @map("is_active")
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  participants ChallengeParticipant[]
+
+  @@map("challenges")
+}
+
+enum ChallengeParticipantStatus {
+  ACTIVE
+  COMPLETED
+  FAILED
+}
+
+model ChallengeParticipant {
+  id          String                     @id @default(cuid())
+  challengeId String                     @map("challenge_id")
+  userId      String                     @map("user_id")
+  progress    String                     @db.Text // JSON
+  status      ChallengeParticipantStatus @default(ACTIVE)
+  joinedAt    DateTime                   @default(now()) @map("joined_at")
+  completedAt DateTime?                  @map("completed_at")
+  rewardedAt  DateTime?                  @map("rewarded_at")
+
+  challenge Challenge @relation(fields: [challengeId], references: [id])
+  user      User      @relation(fields: [userId], references: [id])
+
+  @@unique([challengeId, userId])
+  @@map("challenge_participants")
+}
+
+// =========================================
+// FAZA 2: POWIADOMIENIA
+// =========================================
+
+enum NotificationType {
+  RESERVATION_CONFIRMED
+  RESERVATION_CANCELLED
+  RESERVATION_REMINDER
+  CLASS_CANCELLED
+  PACKAGE_ASSIGNED
+  PACKAGE_EXPIRING
+  PACKAGE_EXPIRED
+  PAYMENT_COMPLETED
+  REFERRAL_REWARD
+  CHALLENGE_COMPLETED
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+  IN_APP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id            String              @id @default(cuid())
+  userId        String              @map("user_id")
+  type          NotificationType
+  channel       NotificationChannel
+  payload       String              @db.Text // JSON
+  status        NotificationStatus  @default(PENDING)
+  scheduledFor  DateTime            @map("scheduled_for")
+  sentAt        DateTime?           @map("sent_at")
+  errorMessage  String?             @db.Text @map("error_message")
+  createdAt     DateTime            @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([status, scheduledFor])
+  @@map("notifications")
+}
+
+// =========================================
+// AUDIT LOG
+// =========================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?  @map("user_id")
+  action     String   // 'reservation.create', 'package.assign', etc.
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  oldValues  String?  @db.Text @map("old_values") // JSON
+  newValues  String?  @db.Text @map("new_values") // JSON
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @db.Text @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
